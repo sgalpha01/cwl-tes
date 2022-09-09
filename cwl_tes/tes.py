@@ -14,6 +14,8 @@ from tempfile import NamedTemporaryFile
 from pprint import pformat
 from typing import (Any, Callable, Dict, List, MutableMapping, MutableSequence,
                     Optional, Union)
+from urllib.parse import urljoin
+import requests
 from typing_extensions import Text
 
 import tes
@@ -39,23 +41,26 @@ from .ftp import abspath
 log = logging.getLogger("tes-backend")
 
 
-def make_tes_tool(spec, loading_context, url, remote_storage_url, token):
+def make_tes_tool(spec, loading_context, url, remote_storage_url,
+                 token, callback_url):
     """cwl-tes specific factory for CWL Process generation."""
     if "class" in spec and spec["class"] == "CommandLineTool":
         return TESCommandLineTool(
-            spec, loading_context, url, remote_storage_url, token)
+            spec, loading_context, url, remote_storage_url, token, callback_url)
     return default_make_tool(spec, loading_context)
 
 
 class TESCommandLineTool(CommandLineTool):
     """cwl-tes specific CommandLineTool."""
 
-    def __init__(self, spec, loading_context, url, remote_storage_url, token):
+    def __init__(self, spec, loading_context, url, remote_storage_url,
+                token, callback_url):
         super(TESCommandLineTool, self).__init__(spec, loading_context)
         self.spec = spec
         self.url = url
         self.remote_storage_url = remote_storage_url
         self.token = token
+        self.callback_url = callback_url
 
     def make_path_mapper(self, reffiles, stagedir, runtimeContext,
                          separateDirs):
@@ -75,7 +80,7 @@ class TESCommandLineTool(CommandLineTool):
         return functools.partial(TESTask, runtime_context=runtimeContext,
                                  url=self.url, spec=self.spec,
                                  remote_storage_url=remote_storage_url,
-                                 token=self.token)
+                                 token=self.token, callback_url=self.callback_url)
 
 
 class TESPathMapper(PathMapper):
@@ -159,6 +164,7 @@ class TESTask(JobBase):
                  runtime_context,
                  url,
                  spec,
+                 callback_url=None, # type: Optional[Text]
                  remote_storage_url=None,
                  token=None):
         super(TESTask, self).__init__(builder, joborder, make_path_mapper,
@@ -176,6 +182,7 @@ class TESTask(JobBase):
         self.poll_interval = 1
         self.poll_retries = 10
         self.client = tes.HTTPClient(url, token=token)
+        self.callback_url = callback_url
         self.remote_storage_url = remote_storage_url
         self.token = token
 
@@ -346,6 +353,7 @@ class TESTask(JobBase):
         create_body = tes.Task(
             name=self.name,
             description=self.spec.get("doc", ""),
+            callback_url=self.callback_url,
             executors=[
                 tes.Executor(
                     command=self.command_line,
@@ -403,37 +411,7 @@ class TESTask(JobBase):
             )
             raise WorkflowException(e)
 
-        max_tries = 10
-        current_try = 1
-        self.exit_code = None
-        while not self.is_done():
-            delay = 1.5 * current_try**2
-            time.sleep(
-                random.randint(
-                    round(
-                        delay -
-                        0.5 *
-                        delay),
-                    round(
-                        delay +
-                        0.5 *
-                        delay)))
-            try:
-                task = self.client.get_task(self.id, "MINIMAL")
-                self.state = task.state
-                log.debug(
-                    "[job %s] POLLING %s, result: %s", self.name,
-                    pformat(self.id), task.state
-                )
-            except Exception as e:
-                log.error("[job %s] POLLING ERROR %s", self.name, e)
-                if current_try <= max_tries:
-                    current_try += 1
-                    continue
-                else:
-                    log.error("[job %s] MAX POLLING RETRIES EXCEEDED",
-                              self.name)
-                    break
+        self.poll(self.callback_url)
 
         try:
             process_status = None
@@ -484,6 +462,86 @@ class TESTask(JobBase):
             log.info(pformat(self.outputs))
             self.cleanup(self.runtime_context.rm_tmpdir)
         return
+
+    def poll(self, from_callback=False):
+        """Polls the TES service / Callback receiver for the status of the task.
+
+        Args:
+            from_callback (bool, optional): True if callback URL is provided. 
+                                            Defaults to False.
+        Raises:
+            Exception: INCONSISTENT_STATE if the task state is not consistent
+                        between the TES service and the callback receiver.
+            Exception: Handle any other exception.
+        """
+        
+        poll_count = 0
+        max_tries = 10
+        current_try = 1
+        self.exit_code = None
+        while not self.is_done():
+            delay = 1.5 * current_try**2
+            time.sleep(
+                random.randint(
+                    round(
+                        delay -
+                        0.5 *
+                        delay),
+                    round(
+                        delay +
+                        0.5 *
+                        delay)))
+            try:
+                poll_count += 1
+                if from_callback and (poll_count % 20 != 0):
+                    #! Todo: find some better way to provide url 
+                    url = requests.compat.urljoin(
+                        "http://localhost:8081/webhook/", self.id
+                        )
+                    response = requests.get(url)
+                    if response.status_code != 200:
+                        raise Exception("STATUS CODE {}".format(response.status_code))
+                    self.state = response.text
+                    # Consistency check
+                    if poll_count % 10 == 0 and self.state == "UNKNOWN":
+                        actual_state = self.client.get_task(self.id, "MINIMAL").state
+                        if actual_state not in ("UNKNOWN", "QUEUED"):
+                            raise Exception("INCONSISTENT STATE")
+                else:
+                    task = self.client.get_task(self.id, "MINIMAL")
+                    self.state = task.state
+                log.debug(
+                    "[job %s] POLLING %s, result: %s", self.name,
+                    pformat(self.id), self.state
+                )
+            except Exception as e:
+                if e == "INCONSISTENT STATE":
+                    from_callback = False
+                    log.error("[job %s] CALLBACK ERROR %s", self.name, e)
+                    log.error("[job %s] FALLING BACK TO DIRECT POLLING", self.name)
+                    continue
+
+                if from_callback:                    
+                    log.error("[job %s] CALLBACK ERROR %s", self.name, e)
+                    if current_try <= max_tries:
+                        current_try += 1
+                        continue
+                    else:
+                        log.error("[job %s] MAX CALLBACK RETRIES EXCEEDED",
+                                self.name)
+                        log.error("[job %s] FALLING BACK TO DIRECT POLLING", self.name)
+                        from_callback = False
+                        current_try = 1
+                else:
+                    log.error("[job %s] POLLING ERROR %s", self.name, e)
+                    if current_try <= max_tries:
+                        current_try += 1
+                        continue
+                    else:
+                        log.error("[job %s] MAX POLLING RETRIES EXCEEDED",
+                                self.name)
+                        break
+                        
 
     def is_done(self):
         terminal_states = ["COMPLETE", "CANCELED", "EXECUTOR_ERROR",

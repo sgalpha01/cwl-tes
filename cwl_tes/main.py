@@ -29,7 +29,7 @@ from cwltool.executors import (MultithreadedJobExecutor, SingleJobExecutor,
 from cwltool.resolver import ga4gh_tool_registries
 from cwltool.pathmapper import visit_class
 from cwltool.process import Process
-
+#! TODO: Revert back to original settings after testing
 from .tes import make_tes_tool, TESPathMapper
 from .__init__ import __version__
 from .ftp import FtpFsAccess
@@ -168,7 +168,7 @@ def main(args=None):
     loading_context.construct_tool_object = functools.partial(
         make_tes_tool, url=parsed_args.tes,
         remote_storage_url=parsed_args.remote_storage_url,
-        token=parsed_args.token)
+        token=parsed_args.token, callback_url=parsed_args.callback_url)
     runtime_context = cwltool.main.RuntimeContext(vars(parsed_args))
     runtime_context.make_fs_access = functools.partial(
         CachingFtpFsAccess, insecure=parsed_args.insecure)
@@ -414,6 +414,8 @@ def arg_parser():  # type: () -> argparse.ArgumentParser
     parser.add_argument("--insecure", action="store_true",
                         help=("Connect securely to FTP server (ignored when "
                               "--remote-storage-url is not set)"))
+    parser.add_argument("--callback-url", type=str,
+                        help="Callback Listener Service URL")
     parser.add_argument("--token", type=str)
     parser.add_argument("--token-public-key", type=str,
                         default=DEFAULT_TOKEN_PUBLIC_KEY)
