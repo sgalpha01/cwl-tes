@@ -42,7 +42,7 @@ setup(
     install_requires=[
         "cwltool==1.0.20191022103248",
         "future>=0.16.0",
-        "py-tes>=0.4.0",
+        "py-tes @ git+https://github.com/sgalpha01/py-tes.git@8005509d68ef03ba90f14b223356832789868f5b",
         "PyJWT>=1.6.4",
         "requests>=2.14.2",
         "typing_extensions>=3.7.4"
